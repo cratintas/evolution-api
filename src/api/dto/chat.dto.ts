@@ -44,7 +44,9 @@ export class NumberBusiness {
   address?: string;
   about?: string;
   vertical?: string;
+  category?: string;
   profilehandle?: string;
+  business_hours?: unknown;
 }
 
 export class ProfileNameDto {
@@ -126,4 +128,9 @@ export class UpdateMessageDto extends Metadata {
 export class BlockUserDto {
   number: string;
   status: 'block' | 'unblock';
+}
+
+export class DisappearingMessagesDto {
+  number: string;
+  expiration: number;
 }

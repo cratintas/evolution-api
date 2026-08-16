@@ -2,14 +2,16 @@ import { PrismaRepository } from '@api/repository/repository.service';
 import { WAMonitoringService } from '@api/services/monitor.service';
 import { configService, Log, Nats } from '@config/env.config';
 import { Logger } from '@config/logger.config';
-import { connect, NatsConnection, StringCodec } from 'nats';
+import { type NatsConnection } from '@nats-io/nats-core';
+import { connect } from '@nats-io/transport-node';
 
 import { EmitData, EventController, EventControllerInterface } from '../event.controller';
 
 export class NatsController extends EventController implements EventControllerInterface {
   public natsClient: NatsConnection | null = null;
   private readonly logger = new Logger('NatsController');
-  private readonly sc = StringCodec();
+  private readonly encoder = new TextEncoder();
+  private readonly decoder = new TextDecoder();
 
   constructor(prismaRepository: PrismaRepository, waMonitor: WAMonitoringService) {
     super(prismaRepository, waMonitor, configService.get<Nats>('NATS')?.ENABLED, 'nats');
@@ -82,7 +84,7 @@ export class NatsController extends EventController implements EventControllerIn
         const subject = `${instanceName}.${event.toLowerCase()}`;
 
         try {
-          this.natsClient.publish(subject, this.sc.encode(JSON.stringify(message)));
+          this.natsClient.publish(subject, this.encoder.encode(JSON.stringify(message)));
 
           if (logEnabled) {
             const logData = {
@@ -102,7 +104,7 @@ export class NatsController extends EventController implements EventControllerIn
       try {
         const subject = prefixKey ? `${prefixKey}.${event.toLowerCase()}` : event.toLowerCase();
 
-        this.natsClient.publish(subject, this.sc.encode(JSON.stringify(message)));
+        this.natsClient.publish(subject, this.encoder.encode(JSON.stringify(message)));
 
         if (logEnabled) {
           const logData = {
@@ -144,7 +146,7 @@ export class NatsController extends EventController implements EventControllerIn
         (async () => {
           for await (const msg of subscription) {
             try {
-              const data = JSON.parse(this.sc.decode(msg.data));
+              const data = JSON.parse(this.decoder.decode(msg.data));
               // Aqui você pode adicionar a lógica de processamento
               this.logger.debug(`Received message on ${subject}:`);
               this.logger.debug(data);

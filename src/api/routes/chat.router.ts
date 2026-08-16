@@ -2,6 +2,7 @@ import { RouterBroker } from '@api/abstract/abstract.router';
 import {
   ArchiveChatDto,
   BlockUserDto,
+  DisappearingMessagesDto,
   DeleteMessage,
   getBase64FromMediaMessageDto,
   MarkChatUnreadDto,
@@ -22,6 +23,7 @@ import { Contact, Message, MessageUpdate } from '@prisma/client';
 import {
   archiveChatSchema,
   blockUserSchema,
+  disappearingMessagesSchema,
   contactValidateSchema,
   deleteMessageSchema,
   markChatUnreadSchema,
@@ -137,6 +139,16 @@ export class ChatRouter extends RouterBroker {
           schema: presenceSchema,
           ClassRef: SendPresenceDto,
           execute: (instance, data) => chatController.sendPresence(instance, data),
+        });
+
+        return res.status(HttpStatus.CREATED).json(response);
+      })
+      .post(this.routerPath('updateDisappearingMessages'), ...guards, async (req, res) => {
+        const response = await this.dataValidate<DisappearingMessagesDto>({
+          request: req,
+          schema: disappearingMessagesSchema,
+          ClassRef: DisappearingMessagesDto,
+          execute: (instance, data) => chatController.setDisappearingMessages(instance, data),
         });
 
         return res.status(HttpStatus.CREATED).json(response);

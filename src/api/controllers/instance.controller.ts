@@ -36,6 +36,9 @@ export class InstanceController {
 
   public async createInstance(instanceData: InstanceDto) {
     try {
+      if (instanceData.instanceName) {
+        instanceData.instanceName = instanceData.instanceName.trim();
+      }
       const instance = channelController.init(instanceData, {
         configService: this.configService,
         eventEmitter: this.eventEmitter,
@@ -468,7 +471,7 @@ export class InstanceController {
         this.logger.error(error);
       }
 
-      this.eventEmitter.emit('remove.instance', instanceName, 'inner');
+      await this.eventEmitter.emitAsync('remove.instance', instanceName, 'inner');
       return { status: 'SUCCESS', error: false, response: { message: 'Instance deleted' } };
     } catch (error) {
       throw new BadRequestException(error.toString());

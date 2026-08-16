@@ -14,6 +14,15 @@ import { Logger } from '@config/logger.config';
 import { NotFoundException } from '@exceptions';
 import { Contact, Message, Prisma } from '@prisma/client';
 import { createJid } from '@utils/createJid';
+import {
+  isLidJid,
+  isPlaceholderContactName,
+  jidLookupValues,
+  phoneJidFromKey,
+  publicPhoneDigits,
+  toPublicPhoneJid,
+} from '@utils/jid-variants';
+import { getOnWhatsappCache, saveOnWhatsappCache } from '@utils/onWhatsappCache';
 import { WASocket } from 'baileys';
 import { isArray } from 'class-validator';
 import EventEmitter2 from 'eventemitter2';
@@ -37,6 +46,52 @@ export class ChannelStartupService {
   public readonly localProxy: wa.LocalProxy = {};
   public readonly localSettings: wa.LocalSettings = {};
   public readonly localWebhook: wa.LocalWebHook = {};
+
+  protected async resolvePublicJids(jids: Array<string | null | undefined>): Promise<Map<string, string>> {
+    const resolved = new Map<string, string>();
+    const lids = [...new Set(jids.filter((jid): jid is string => !!jid && isLidJid(jid)))];
+    if (lids.length === 0) return resolved;
+
+    const cached = await getOnWhatsappCache(lids);
+    for (const item of cached) {
+      const phoneJid = toPublicPhoneJid(item.remoteJid) || item.jidOptions.map((option) => toPublicPhoneJid(option)).find(Boolean);
+      if (!phoneJid) continue;
+      for (const option of item.jidOptions) {
+        if (isLidJid(option)) resolved.set(option, phoneJid);
+      }
+      if (isLidJid(item.remoteJid)) resolved.set(item.remoteJid, phoneJid);
+      for (const lid of lids) {
+        if (item.jidOptions.includes(lid) || item.jidOptions.some((option) => option.includes(lid))) {
+          resolved.set(lid, phoneJid);
+        }
+      }
+    }
+
+    const missing = lids.filter((jid) => !resolved.has(jid));
+    const mapping = (this.client as WASocket & { signalRepository?: { lidMapping?: { getPNForLID?: (jid: string) => Promise<string | null> } } })
+      ?.signalRepository?.lidMapping;
+    if (mapping?.getPNForLID && missing.length > 0) {
+      const chunkSize = 8;
+      for (let index = 0; index < missing.length; index += chunkSize) {
+        const chunk = missing.slice(index, index + chunkSize);
+        await Promise.all(
+          chunk.map(async (lid) => {
+            try {
+              const phoneJid = toPublicPhoneJid(await mapping.getPNForLID(lid));
+              if (phoneJid) {
+                resolved.set(lid, phoneJid);
+                await saveOnWhatsappCache([{ remoteJid: phoneJid, remoteJidAlt: lid, lid: 'lid' }]);
+              }
+            } catch {
+              // keep LID when WhatsApp has no PN mapping yet
+            }
+          }),
+        );
+      }
+    }
+
+    return resolved;
+  }
 
   public chatwootService = new ChatwootService(
     waMonitor,
@@ -526,14 +581,20 @@ export class ChannelStartupService {
     }
 
     const contacts = await this.prismaRepository.contact.findMany(contactFindManyArgs);
+    const publicJids = await this.resolvePublicJids(contacts.map((contact) => contact.remoteJid));
 
     return contacts.map((contact) => {
       const remoteJid = contact.remoteJid;
+      const resolvedJid = publicJids.get(remoteJid) || remoteJid;
       const isGroup = remoteJid.endsWith('@g.us');
-      const isSaved = !!contact.pushName || !!contact.profilePicUrl;
+      const isSaved = (!!contact.pushName && !isPlaceholderContactName(contact.pushName, remoteJid)) || !!contact.profilePicUrl;
       const type = isGroup ? 'group' : isSaved ? 'contact' : 'group_member';
+      const phone = publicPhoneDigits(resolvedJid);
       return {
         ...contact,
+        pushName: isPlaceholderContactName(contact.pushName, remoteJid) ? null : contact.pushName,
+        phone,
+        phoneJid: phone ? `${phone}@s.whatsapp.net` : null,
         isGroup,
         isSaved,
         type,
@@ -604,6 +665,11 @@ export class ChannelStartupService {
       remoteJid?: string;
       participants?: string;
     };
+    const jids = jidLookupValues(keyFilters?.remoteJid);
+    const jidFilters = jids.flatMap((jid) => [
+      { key: { path: ['remoteJid'], equals: jid } },
+      { key: { path: ['remoteJidAlt'], equals: jid } },
+    ]);
 
     const timestampFilter = {};
     if (query?.where?.messageTimestamp) {
@@ -625,7 +691,7 @@ export class ChannelStartupService {
         AND: [
           keyFilters?.id ? { key: { path: ['id'], equals: keyFilters?.id } } : {},
           keyFilters?.fromMe ? { key: { path: ['fromMe'], equals: keyFilters?.fromMe } } : {},
-          keyFilters?.remoteJid ? { key: { path: ['remoteJid'], equals: keyFilters?.remoteJid } } : {},
+          jidFilters.length > 0 ? { OR: jidFilters } : keyFilters?.remoteJid ? { key: { path: ['remoteJid'], equals: keyFilters.remoteJid } } : {},
           keyFilters?.participants ? { key: { path: ['participants'], equals: keyFilters?.participants } } : {},
         ],
       },
@@ -649,7 +715,7 @@ export class ChannelStartupService {
         AND: [
           keyFilters?.id ? { key: { path: ['id'], equals: keyFilters?.id } } : {},
           keyFilters?.fromMe ? { key: { path: ['fromMe'], equals: keyFilters?.fromMe } } : {},
-          keyFilters?.remoteJid ? { key: { path: ['remoteJid'], equals: keyFilters?.remoteJid } } : {},
+          jidFilters.length > 0 ? { OR: jidFilters } : keyFilters?.remoteJid ? { key: { path: ['remoteJid'], equals: keyFilters.remoteJid } } : {},
           keyFilters?.participants ? { key: { path: ['participants'], equals: keyFilters?.participants } } : {},
         ],
       },
@@ -668,6 +734,7 @@ export class ChannelStartupService {
         instanceId: true,
         source: true,
         contextInfo: true,
+        status: true,
         MessageUpdate: {
           select: {
             status: true,
@@ -676,12 +743,24 @@ export class ChannelStartupService {
       },
     });
 
+    const records = messages.map((message) => {
+      const messageKey = message.key as { remoteJid?: string; remoteJidAlt?: string; fromMe?: boolean };
+      const phoneJid = phoneJidFromKey(messageKey);
+      if (phoneJid && phoneJid !== messageKey.remoteJid) {
+        return {
+          ...message,
+          key: { ...messageKey, remoteJid: phoneJid, remoteJidAlt: messageKey.remoteJid },
+        };
+      }
+      return message;
+    });
+
     return {
       messages: {
         total: count,
         pages: Math.ceil(count / query.offset),
         currentPage: query.page,
-        records: messages,
+        records,
       },
     };
   }
@@ -746,19 +825,44 @@ export class ChannelStartupService {
         SELECT DISTINCT ON ("Message"."key"->>'remoteJid') 
           "Contact"."id" as "contactId",
           "Message"."key"->>'remoteJid' as "remoteJid",
-          CASE 
-            WHEN "Message"."key"->>'remoteJid' LIKE '%@g.us' THEN COALESCE("Chat"."name", "Contact"."pushName")
-            ELSE COALESCE("Contact"."pushName", "Message"."pushName")
+          COALESCE(
+            CASE
+              WHEN "Message"."key"->>'remoteJidAlt' IS NOT NULL
+                AND "Message"."key"->>'remoteJidAlt' NOT LIKE '%@lid'
+                AND "Message"."key"->>'remoteJidAlt' NOT LIKE '%@g.us'
+                AND "Message"."key"->>'remoteJidAlt' NOT LIKE '%@hosted%'
+              THEN "Message"."key"->>'remoteJidAlt'
+            END,
+            CASE
+              WHEN "Message"."key"->>'remoteJid' NOT LIKE '%@lid'
+                AND "Message"."key"->>'remoteJid' NOT LIKE '%@hosted%'
+              THEN "Message"."key"->>'remoteJid'
+            END,
+            CASE
+              WHEN "Contact"."remoteJid" NOT LIKE '%@lid'
+              THEN "Contact"."remoteJid"
+            END,
+            "Message"."key"->>'remoteJid'
+          ) as "phoneJid",
+          CASE
+            WHEN "Message"."key"->>'remoteJid' LIKE '%@g.us'
+              THEN COALESCE(NULLIF("Chat"."name", ''), NULLIF("Contact"."pushName", ''), NULLIF("Message"."pushName", ''))
+            ELSE COALESCE(
+              NULLIF("Contact"."pushName", ''),
+              NULLIF("Chat"."name", ''),
+              CASE WHEN "Message"."key"->>'fromMe' = 'true' THEN NULL ELSE NULLIF("Message"."pushName", '') END
+            )
           END as "pushName",
           "Contact"."profilePicUrl",
           COALESCE(
-            to_timestamp("Message"."messageTimestamp"::double precision), 
+            to_timestamp("Message"."messageTimestamp"::double precision),
+            "Chat"."updatedAt",
             "Contact"."updatedAt"
           ) as "updatedAt",
-          "Chat"."name" as "pushName",
+          "Chat"."labels" as "labels",
           "Chat"."createdAt" as "windowStart",
           "Chat"."createdAt" + INTERVAL '24 hours' as "windowExpires",
-          "Chat"."unreadMessages" as "unreadMessages",
+          COALESCE("Chat"."unreadMessages", 0) as "unreadMessages",
           CASE WHEN "Chat"."createdAt" + INTERVAL '24 hours' > NOW() THEN true ELSE false END as "windowActive",
           "Message"."id" AS "lastMessageId",
           "Message"."key" AS "lastMessage_key",
@@ -774,12 +878,32 @@ export class ChannelStartupService {
           "Message"."messageTimestamp" AS "lastMessageMessageTimestamp",
           "Message"."instanceId" AS "lastMessageInstanceId",
           "Message"."sessionId" AS "lastMessageSessionId",
-          "Message"."status" AS "lastMessageStatus"
+          "Message"."status" AS "lastMessageStatus",
+          (
+            SELECT mu.status
+            FROM "MessageUpdate" mu
+            WHERE mu."messageId" = "Message"."id"
+            ORDER BY
+              CASE
+                WHEN mu.status IN ('READ', 'PLAYED', '5', '4') THEN 4
+                WHEN mu.status IN ('DELIVERY_ACK', 'DELIVERED', '3') THEN 3
+                WHEN mu.status IN ('SERVER_ACK', '2') THEN 2
+                WHEN mu.status IN ('PENDING', '1') THEN 1
+                ELSE 0
+              END DESC
+            LIMIT 1
+          ) AS "lastMessageUpdateStatus"
         FROM "Message"
-        LEFT JOIN "Contact" ON "Contact"."remoteJid" = "Message"."key"->>'remoteJid' AND "Contact"."instanceId" = "Message"."instanceId"
+        LEFT JOIN "Contact" ON "Contact"."instanceId" = "Message"."instanceId" AND (
+          "Contact"."remoteJid" = "Message"."key"->>'remoteJid'
+          OR "Contact"."remoteJid" = "Message"."key"->>'remoteJidAlt'
+        )
         LEFT JOIN "Chat" ON "Chat"."remoteJid" = "Message"."key"->>'remoteJid' AND "Chat"."instanceId" = "Message"."instanceId"
         WHERE "Message"."instanceId" = ${this.instanceId}
-        ${remoteJid ? Prisma.sql`AND "Message"."key"->>'remoteJid' = ${remoteJid}` : Prisma.sql``}
+        ${remoteJid ? Prisma.sql`AND (
+          "Message"."key"->>'remoteJid' = ${remoteJid}
+          OR "Message"."key"->>'remoteJidAlt' = ${remoteJid}
+        )` : Prisma.sql``}
         ${timestampFilter}
         ORDER BY "Message"."key"->>'remoteJid', "Message"."messageTimestamp" DESC
       )
@@ -804,26 +928,111 @@ export class ChannelStartupService {
               messageTimestamp: contact.lastMessageMessageTimestamp,
               instanceId: contact.lastMessageInstanceId,
               sessionId: contact.lastMessageSessionId,
-              status: contact.lastMessageStatus,
+              status: [contact.lastMessageUpdateStatus, contact.lastMessageStatus].sort((left: string, right: string) => {
+                const rank = (value?: string) => {
+                  const status = String(value || '').toUpperCase();
+                  if (['READ', 'PLAYED', '4', '5'].includes(status)) return 4;
+                  if (['DELIVERY_ACK', 'DELIVERED', '3'].includes(status)) return 3;
+                  if (['SERVER_ACK', '2'].includes(status)) return 2;
+                  if (['PENDING', '1'].includes(status)) return 1;
+                  return 0;
+                };
+                return rank(right) - rank(left);
+              })[0],
             }
           : undefined;
 
         return {
           id: contact.contactId || null,
           remoteJid: contact.remoteJid,
-          pushName: contact.pushName,
+          phoneJid: contact.phoneJid,
+          phone: publicPhoneDigits(contact.phoneJid || contact.remoteJid),
+          pushName: isPlaceholderContactName(contact.pushName) ? null : contact.pushName,
           profilePicUrl: contact.profilePicUrl,
           updatedAt: contact.updatedAt,
+          labels: contact.labels ?? null,
           windowStart: contact.windowStart,
           windowExpires: contact.windowExpires,
           windowActive: contact.windowActive,
           lastMessage: lastMessage ? this.cleanMessageData(lastMessage) : undefined,
-          unreadCount: contact.unreadMessages,
+          unreadCount: contact.unreadMessages ?? 0,
           isSaved: !!contact.contactId,
+          archived: Array.isArray(contact.labels)
+            ? contact.labels.some((item: unknown) => String(item).toLowerCase() === 'archived')
+            : false,
         };
       });
 
-      return mappedResults;
+      const contacts = await this.prismaRepository.contact.findMany({
+        where: { instanceId: this.instanceId },
+        select: { remoteJid: true, pushName: true, profilePicUrl: true },
+      });
+      const contactsByJid = new Map(contacts.map((contact) => [contact.remoteJid, contact]));
+      const contactsByPhone = new Map(
+        contacts
+          .map((contact) => [publicPhoneDigits(contact.remoteJid), contact] as const)
+          .filter(([phone]) => !!phone),
+      );
+      const missingLids = mappedResults
+        .filter((chat) => !publicPhoneDigits(chat.phoneJid || chat.remoteJid))
+        .map((chat) => chat.remoteJid);
+      const storedChats = await this.prismaRepository.chat.findMany({
+        where: { instanceId: this.instanceId },
+        select: { remoteJid: true, unreadMessages: true },
+      });
+      const unreadByJid = new Map(storedChats.map((item) => [item.remoteJid, item.unreadMessages || 0]));
+
+      const publicJids = await this.resolvePublicJids(missingLids);
+
+      const resolved = mappedResults.map((chat) => {
+        const resolvedJid =
+          toPublicPhoneJid(chat.phoneJid) || publicJids.get(chat.remoteJid) || toPublicPhoneJid(chat.remoteJid);
+        const phone = publicPhoneDigits(resolvedJid);
+        const contact = contactsByJid.get(chat.remoteJid) || (phone ? contactsByPhone.get(phone) : undefined);
+        const pushName = !isPlaceholderContactName(contact?.pushName, chat.remoteJid)
+          ? contact?.pushName
+          : isPlaceholderContactName(chat.pushName, chat.remoteJid)
+            ? null
+            : chat.pushName;
+        const unreadFromStore = Math.max(
+          unreadByJid.get(chat.remoteJid) || 0,
+          ...(phone ? jidLookupValues(`${phone}@s.whatsapp.net`).map((jid) => unreadByJid.get(jid) || 0) : []),
+          ...jidLookupValues(chat.remoteJid).map((jid) => unreadByJid.get(jid) || 0),
+        );
+        return {
+          ...chat,
+          phone: phone || null,
+          phoneJid: phone ? `${phone}@s.whatsapp.net` : null,
+          pushName,
+          profilePicUrl: chat.profilePicUrl || contact?.profilePicUrl || null,
+          unreadCount: Math.max(chat.unreadCount || 0, unreadFromStore),
+        };
+      });
+
+      const merged = new Map<string, (typeof resolved)[number]>();
+      for (const chat of resolved) {
+        const key = chat.phone || chat.remoteJid;
+        const existing = merged.get(key);
+        if (!existing) {
+          merged.set(key, chat);
+          continue;
+        }
+        const existingTime = new Date(existing.updatedAt || 0).getTime();
+        const nextTime = new Date(chat.updatedAt || 0).getTime();
+        const newer = nextTime >= existingTime ? chat : existing;
+        const older = newer === chat ? existing : chat;
+        merged.set(key, {
+          ...older,
+          ...newer,
+          remoteJid: newer.remoteJid?.includes('@lid') && !older.remoteJid?.includes('@lid') ? older.remoteJid : newer.remoteJid,
+          phone: newer.phone || older.phone,
+          phoneJid: newer.phoneJid || older.phoneJid,
+          pushName: newer.pushName || older.pushName,
+          profilePicUrl: newer.profilePicUrl || older.profilePicUrl,
+          unreadCount: Math.max(existing.unreadCount || 0, chat.unreadCount || 0),
+        });
+      }
+      return [...merged.values()];
     }
 
     return [];

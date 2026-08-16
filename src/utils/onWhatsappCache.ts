@@ -12,15 +12,14 @@ function getAvailableNumbers(remoteJid: string) {
     remoteJid = remoteJid.slice(1);
   }
 
-  const [number, domain] = remoteJid.split('@');
+  const [userWithDevice, domain] = remoteJid.split('@');
+  const number = (userWithDevice || '').split(':')[0];
 
-  // TODO: Se já for @lid, retornar apenas ele mesmo SEM adicionar @domain novamente
-  if (domain === 'lid' || domain === 'g.us') {
-    return [remoteJid]; // Retorna direto para @lid e @g.us
+  if (domain === 'lid' || domain === 'g.us' || domain === 'hosted' || domain === 'hosted.lid') {
+    return [remoteJid];
   }
 
-  // Brazilian numbers
-  if (remoteJid.startsWith('55')) {
+  if (number.startsWith('55')) {
     const numberWithDigit =
       number.slice(4, 5) === '9' && number.length === 13 ? number : `${number.slice(0, 4)}9${number.slice(4)}`;
     const numberWithoutDigit = number.length === 12 ? number : number.slice(0, 4) + number.slice(5);
@@ -50,9 +49,8 @@ function getAvailableNumbers(remoteJid: string) {
     numbersAvailable.push(numberWithoutDigit);
   }
 
-  // Other countries
   else {
-    numbersAvailable.push(remoteJid);
+    numbersAvailable.push(number);
   }
 
   // TODO: Adiciona @domain apenas para números que não são @lid

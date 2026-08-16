@@ -10,6 +10,7 @@ import {
   evoaiStatusSchema,
   instanceSchema,
 } from '@validate/validate.schema';
+import { routeParam } from '@utils/route-param';
 import { RequestHandler, Router } from 'express';
 
 import { EvoaiDto, EvoaiSettingDto } from '../dto/evoai.dto';
@@ -43,7 +44,7 @@ export class EvoaiRouter extends RouterBroker {
           request: req,
           schema: instanceSchema,
           ClassRef: InstanceDto,
-          execute: (instance) => evoaiController.fetchBot(instance, req.params.evoaiId),
+          execute: (instance) => evoaiController.fetchBot(instance, routeParam(req.params.evoaiId)),
         });
 
         res.status(HttpStatus.OK).json(response);
@@ -53,7 +54,7 @@ export class EvoaiRouter extends RouterBroker {
           request: req,
           schema: evoaiSchema,
           ClassRef: EvoaiDto,
-          execute: (instance, data) => evoaiController.updateBot(instance, req.params.evoaiId, data),
+          execute: (instance, data) => evoaiController.updateBot(instance, routeParam(req.params.evoaiId), data),
         });
 
         res.status(HttpStatus.OK).json(response);
@@ -63,7 +64,7 @@ export class EvoaiRouter extends RouterBroker {
           request: req,
           schema: instanceSchema,
           ClassRef: InstanceDto,
-          execute: (instance) => evoaiController.deleteBot(instance, req.params.evoaiId),
+          execute: (instance) => evoaiController.deleteBot(instance, routeParam(req.params.evoaiId)),
         });
 
         res.status(HttpStatus.OK).json(response);
@@ -103,7 +104,7 @@ export class EvoaiRouter extends RouterBroker {
           request: req,
           schema: instanceSchema,
           ClassRef: InstanceDto,
-          execute: (instance) => evoaiController.fetchSessions(instance, req.params.evoaiId),
+          execute: (instance) => evoaiController.fetchSessions(instance, routeParam(req.params.evoaiId)),
         });
 
         res.status(HttpStatus.OK).json(response);
