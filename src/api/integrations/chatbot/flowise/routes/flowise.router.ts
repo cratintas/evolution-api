@@ -4,6 +4,7 @@ import { InstanceDto } from '@api/dto/instance.dto';
 import { HttpStatus } from '@api/routes/index.router';
 import { flowiseController } from '@api/server.module';
 import { instanceSchema } from '@validate/instance.schema';
+import { routeParam } from '@utils/route-param';
 import { RequestHandler, Router } from 'express';
 
 import { FlowiseDto, FlowiseSettingDto } from '../dto/flowise.dto';
@@ -43,7 +44,7 @@ export class FlowiseRouter extends RouterBroker {
           request: req,
           schema: instanceSchema,
           ClassRef: InstanceDto,
-          execute: (instance) => flowiseController.fetchBot(instance, req.params.flowiseId),
+          execute: (instance) => flowiseController.fetchBot(instance, routeParam(req.params.flowiseId)),
         });
 
         res.status(HttpStatus.OK).json(response);
@@ -53,7 +54,7 @@ export class FlowiseRouter extends RouterBroker {
           request: req,
           schema: flowiseSchema,
           ClassRef: FlowiseDto,
-          execute: (instance, data) => flowiseController.updateBot(instance, req.params.flowiseId, data),
+          execute: (instance, data) => flowiseController.updateBot(instance, routeParam(req.params.flowiseId), data),
         });
 
         res.status(HttpStatus.OK).json(response);
@@ -63,7 +64,7 @@ export class FlowiseRouter extends RouterBroker {
           request: req,
           schema: instanceSchema,
           ClassRef: InstanceDto,
-          execute: (instance) => flowiseController.deleteBot(instance, req.params.flowiseId),
+          execute: (instance) => flowiseController.deleteBot(instance, routeParam(req.params.flowiseId)),
         });
 
         res.status(HttpStatus.OK).json(response);
@@ -103,7 +104,7 @@ export class FlowiseRouter extends RouterBroker {
           request: req,
           schema: instanceSchema,
           ClassRef: InstanceDto,
-          execute: (instance) => flowiseController.fetchSessions(instance, req.params.flowiseId),
+          execute: (instance) => flowiseController.fetchSessions(instance, routeParam(req.params.flowiseId)),
         });
 
         res.status(HttpStatus.OK).json(response);

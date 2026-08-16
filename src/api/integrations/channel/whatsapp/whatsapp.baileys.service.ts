@@ -81,6 +81,7 @@ import { Boom } from '@hapi/boom';
 import { createId as cuid } from '@paralleldrive/cuid2';
 import { Instance, Message } from '@prisma/client';
 import { createJid } from '@utils/createJid';
+import { isLidJid, isPlaceholderContactName, jidLookupValues, phoneJidFromKey, publicPhoneDigits, toPublicPhoneJid } from '@utils/jid-variants';
 import { fetchLatestWaWebVersion } from '@utils/fetchLatestWaWebVersion';
 import { makeProxyAgent, makeProxyAgentUndici } from '@utils/makeProxyAgent';
 import { getOnWhatsappCache, saveOnWhatsappCache } from '@utils/onWhatsappCache';
@@ -137,7 +138,6 @@ import { spawn } from 'child_process';
 import { isArray, isBase64, isURL } from 'class-validator';
 import { createHash } from 'crypto';
 import EventEmitter2 from 'eventemitter2';
-import ffmpeg from 'fluent-ffmpeg';
 import FormData from 'form-data';
 import Long from 'long';
 import mimeTypes from 'mime-types';
@@ -249,6 +249,9 @@ export class BaileysStartupService extends ChannelStartupService {
   private readonly msgRetryCounterCache: CacheStore = new NodeCache();
   private readonly userDevicesCache: CacheStore = new NodeCache({ stdTTL: 300000, useClones: false });
   private endSession = false;
+  private connectAttemptStartedAt: number | null = null;
+  private connectTimeoutTimer: NodeJS.Timeout | null = null;
+  private connectTimedOut = false;
   private logBaileys = this.configService.get<Log>('LOG').BAILEYS;
   private eventProcessingQueue: Promise<void> = Promise.resolve();
 
@@ -265,10 +268,49 @@ export class BaileysStartupService extends ChannelStartupService {
   }
 
   public async logoutInstance() {
-    this.messageProcessor.onDestroy();
-    await this.client?.logout('Log out instance: ' + this.instanceName);
+    this.endSession = true;
+    this.connectTimedOut = false;
+    this.clearConnectTimeout();
+    this.connectAttemptStartedAt = null;
+    this.stateConnection = {
+      state: 'close',
+      statusReason: DisconnectReason.loggedOut,
+    };
 
-    this.client?.ws?.close();
+    try {
+      await this.prismaRepository.instance.update({
+        where: { id: this.instanceId },
+        data: { connectionStatus: 'close' },
+      });
+    } catch (error) {
+      this.logger.error(error);
+    }
+
+    this.sendDataWebhook(Events.CONNECTION_UPDATE, {
+      instance: this.instance.name,
+      state: 'close',
+      statusReason: DisconnectReason.loggedOut,
+    });
+
+    this.messageProcessor.onDestroy();
+
+    try {
+      if (this.client?.logout) {
+        await Promise.race([
+          this.client.logout('Log out instance: ' + this.instance.name),
+          new Promise((resolve) => setTimeout(resolve, 1500)),
+        ]);
+      }
+    } catch (error) {
+      this.logger.error(error);
+    }
+
+    try {
+      this.client?.ws?.close();
+      this.client?.end(new Error('Instance logged out'));
+    } catch (error) {
+      this.logger.error(error);
+    }
 
     const db = this.configService.get<Database>('DATABASE');
     const cache = this.configService.get<CacheConf>('CACHE');
@@ -329,6 +371,106 @@ export class BaileysStartupService extends ChannelStartupService {
       base64: this.instance.qrcode?.base64,
       count: this.instance.qrcode?.count,
     };
+  }
+
+  private connectTimeoutMs(): number {
+    const seconds = this.configService.get<QrCode>('QRCODE').CONNECT_TIMEOUT || 60;
+    return Math.min(60, Math.max(10, seconds)) * 1000;
+  }
+
+  private clearConnectTimeout() {
+    if (this.connectTimeoutTimer) {
+      clearTimeout(this.connectTimeoutTimer);
+      this.connectTimeoutTimer = null;
+    }
+  }
+
+  private resetConnectAttempt() {
+    this.clearConnectTimeout();
+    this.connectAttemptStartedAt = Date.now();
+    this.connectTimedOut = false;
+    this.endSession = false;
+  }
+
+  private armConnectTimeout() {
+    if (this.connectTimeoutTimer || this.stateConnection?.state === 'open') {
+      return;
+    }
+    if (!this.connectAttemptStartedAt) {
+      this.connectAttemptStartedAt = Date.now();
+    }
+    const remaining = Math.max(0, this.connectTimeoutMs() - (Date.now() - this.connectAttemptStartedAt));
+    this.connectTimeoutTimer = setTimeout(() => {
+      void this.refuseStaleConnection();
+    }, remaining);
+  }
+
+  private async refuseStaleConnection() {
+    if (this.stateConnection?.state === 'open') {
+      this.clearConnectTimeout();
+      this.connectAttemptStartedAt = null;
+      this.connectTimedOut = false;
+      return;
+    }
+
+    this.connectTimedOut = true;
+    this.endSession = true;
+    this.clearConnectTimeout();
+    this.logger.warn(`Connection attempt timed out after ${this.connectTimeoutMs() / 1000}s for instance ${this.instance.name}`);
+
+    this.sendDataWebhook(Events.QRCODE_UPDATED, {
+      message: 'Connection timeout, please login again',
+      statusCode: DisconnectReason.timedOut,
+    });
+
+    this.sendDataWebhook(Events.CONNECTION_UPDATE, {
+      instance: this.instance.name,
+      state: 'refused',
+      statusReason: DisconnectReason.timedOut,
+      wuid: this.instance.wuid,
+      profileName: await this.getProfileName().catch(() => undefined),
+      profilePictureUrl: this.instance.profilePictureUrl,
+    });
+
+    try {
+      await this.prismaRepository.instance.update({
+        where: { id: this.instanceId },
+        data: { connectionStatus: 'close' },
+      });
+    } catch (error) {
+      this.logger.error(error);
+    }
+
+    this.instance.qrcode = { count: 0 };
+    this.stateConnection = {
+      state: 'close',
+      statusReason: DisconnectReason.timedOut,
+    };
+
+    try {
+      this.client?.ws?.close();
+      this.client?.end(new Error('Connection attempt timeout'));
+    } catch (error) {
+      this.logger.error(error);
+    }
+  }
+
+  private async resolvePublicJid(jid?: string): Promise<string | undefined> {
+    if (!jid) return undefined;
+    if (publicPhoneDigits(jid) || !isLidJid(jid)) return jid;
+
+    const mapped = await this.resolvePublicJids([jid]);
+    if (mapped.get(jid)) return mapped.get(jid);
+
+    const stored = await this.prismaRepository.message.findFirst({
+      where: {
+        instanceId: this.instanceId,
+        OR: [{ key: { path: ['remoteJid'], equals: jid } }, { key: { path: ['remoteJidAlt'], equals: jid } }],
+      },
+      select: { key: true },
+    });
+
+    return phoneJidFromKey(stored?.key as { remoteJid?: string; remoteJidAlt?: string }) || jid;
   }
 
   private async connectionUpdate({ qr, connection, lastDisconnect }: Partial<ConnectionState>) {
@@ -414,6 +556,8 @@ export class BaileysStartupService extends ChannelStartupService {
         where: { id: this.instanceId },
         data: { connectionStatus: 'connecting' },
       });
+
+      this.armConnectTimeout();
     }
 
     if (connection) {
@@ -426,9 +570,22 @@ export class BaileysStartupService extends ChannelStartupService {
     if (connection === 'close') {
       const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode;
       const codesToNotReconnect = [DisconnectReason.loggedOut, DisconnectReason.forbidden, 402, 406];
-      const shouldReconnect = !codesToNotReconnect.includes(statusCode);
-      if (shouldReconnect) {
-        await this.connectToWhatsapp(this.phoneNumber);
+      const shouldReconnect =
+        !this.endSession &&
+        !this.connectTimedOut &&
+        !codesToNotReconnect.includes(statusCode);
+      const attemptExpired =
+        !!this.connectAttemptStartedAt && Date.now() - this.connectAttemptStartedAt >= this.connectTimeoutMs();
+
+      if (shouldReconnect && !attemptExpired) {
+        await this.connectToWhatsapp(this.phoneNumber, { resume: true });
+      } else if (attemptExpired && !this.connectTimedOut) {
+        await this.refuseStaleConnection();
+      } else if (this.connectTimedOut) {
+        this.stateConnection = {
+          state: 'close',
+          statusReason: DisconnectReason.timedOut,
+        };
       } else {
         this.sendDataWebhook(Events.STATUS_INSTANCE, {
           instance: this.instance.name,
@@ -465,6 +622,10 @@ export class BaileysStartupService extends ChannelStartupService {
     }
 
     if (connection === 'open') {
+      this.clearConnectTimeout();
+      this.connectAttemptStartedAt = null;
+      this.connectTimedOut = false;
+      this.endSession = false;
       this.instance.wuid = this.client.user.id.replace(/:\d+/, '');
       try {
         const profilePic = await this.profilePicture(this.instance.wuid);
@@ -516,6 +677,7 @@ export class BaileysStartupService extends ChannelStartupService {
     }
 
     if (connection === 'connecting') {
+      this.armConnectTimeout();
       this.sendDataWebhook(Events.CONNECTION_UPDATE, { instance: this.instance.name, ...this.stateConnection });
     }
   }
@@ -720,12 +882,17 @@ export class BaileysStartupService extends ChannelStartupService {
     return this.client;
   }
 
-  public async connectToWhatsapp(number?: string): Promise<WASocket> {
+  public async connectToWhatsapp(number?: string, options?: { resume?: boolean }): Promise<WASocket> {
     try {
       this.loadChatwoot();
       this.loadSettings();
       this.loadWebhook();
       this.loadProxy();
+
+      if (!options?.resume) {
+        this.resetConnectAttempt();
+      }
+      this.armConnectTimeout();
 
       // Remontar o messageProcessor para garantir que está funcionando após reconexão
       this.messageProcessor.mount({
@@ -763,35 +930,61 @@ export class BaileysStartupService extends ChannelStartupService {
           remoteJid: chat.id,
           instanceId: this.instanceId,
           name: chat.name,
-          unreadMessages: chat.unreadCount !== undefined ? chat.unreadCount : 0,
+          unreadMessages: chat.unreadCount !== undefined ? (chat.unreadCount < 0 ? 1 : chat.unreadCount) : 0,
         }));
 
       this.sendDataWebhook(Events.CHATS_UPSERT, chatsToInsert);
 
-      if (chatsToInsert.length > 0) {
-        if (this.configService.get<Database>('DATABASE').SAVE_DATA.CHATS)
+      if (this.configService.get<Database>('DATABASE').SAVE_DATA.CHATS) {
+        if (chatsToInsert.length > 0) {
           await this.prismaRepository.chat.createMany({ data: chatsToInsert, skipDuplicates: true });
+        }
+        await Promise.all(
+          chats
+            .filter((chat) => existingChatIdSet.has(chat.id) && typeof chat.unreadCount === 'number')
+            .map((chat) =>
+              this.prismaRepository.chat.updateMany({
+                where: { instanceId: this.instanceId, remoteJid: chat.id },
+                data: { unreadMessages: chat.unreadCount, ...(chat.name ? { name: chat.name } : {}) },
+              }),
+            ),
+        );
       }
     },
 
     'chats.update': async (
       chats: Partial<
-        proto.IConversation & { lastMessageRecvTimestamp?: number } & {
+        proto.IConversation & { lastMessageRecvTimestamp?: number; unreadCount?: number; archived?: boolean } & {
           conditional: (bufferedData: BufferedEventData) => boolean;
         }
       >[],
     ) => {
       const chatsRaw = chats.map((chat) => {
-        return { remoteJid: chat.id, instanceId: this.instanceId };
+        return { remoteJid: chat.id, instanceId: this.instanceId, unreadCount: chat.unreadCount };
       });
 
       this.sendDataWebhook(Events.CHATS_UPDATE, chatsRaw);
 
       for (const chat of chats) {
-        await this.prismaRepository.chat.updateMany({
-          where: { instanceId: this.instanceId, remoteJid: chat.id, name: chat.name },
-          data: { remoteJid: chat.id },
+        if (!chat.id) continue;
+        const unread =
+          typeof chat.unreadCount === 'number' ? (chat.unreadCount < 0 ? 1 : chat.unreadCount) : undefined;
+        await this.prismaRepository.chat.upsert({
+          where: { instanceId_remoteJid: { instanceId: this.instanceId, remoteJid: chat.id } },
+          create: {
+            instanceId: this.instanceId,
+            remoteJid: chat.id,
+            name: chat.name || undefined,
+            unreadMessages: unread ?? 0,
+          },
+          update: {
+            ...(chat.name ? { name: chat.name } : {}),
+            ...(unread !== undefined ? { unreadMessages: unread } : {}),
+          },
         });
+        if (typeof chat.archived === 'boolean') {
+          await this.persistChatArchive(chat.id, chat.archived);
+        }
       }
     },
 
@@ -1366,13 +1559,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
             if (!cachedTimestamp) {
               if (!received.key.fromMe) {
-                if (msg.status === status[3]) {
-                  this.logger.log(`Update not read messages ${remoteJid}`);
-                  await this.updateChatUnreadMessages(remoteJid);
-                } else if (msg.status === status[4]) {
-                  this.logger.log(`Update readed messages ${remoteJid} - ${timestamp}`);
-                  await this.updateMessagesReadedByTimestamp(remoteJid, timestamp);
-                }
+                await this.incrementChatUnread(remoteJid);
               } else {
                 // is send message by me
                 this.logger.log(`Update readed messages ${remoteJid} - ${timestamp}`);
@@ -1475,8 +1662,10 @@ export class BaileysStartupService extends ChannelStartupService {
           this.logger.verbose(messageRaw);
 
           sendTelemetry(`received.message.${messageRaw.messageType ?? 'unknown'}`);
-          if (messageRaw.key.remoteJid?.includes('@lid') && messageRaw.key.remoteJidAlt) {
-            messageRaw.key.remoteJid = messageRaw.key.remoteJidAlt;
+          const publicJid = phoneJidFromKey(messageRaw.key) || messageRaw.key.remoteJid;
+          if (publicJid && messageRaw.key.remoteJid !== publicJid) {
+            messageRaw.key.remoteJidAlt = messageRaw.key.remoteJid;
+            messageRaw.key.remoteJid = publicJid;
           }
           console.log(messageRaw);
 
@@ -1489,19 +1678,21 @@ export class BaileysStartupService extends ChannelStartupService {
             pushName: messageRaw.pushName,
           });
 
+          const contactLookup = [publicJid, received.key.remoteJid, received.key.remoteJidAlt].filter(Boolean) as string[];
           const contact = await this.prismaRepository.contact.findFirst({
-            where: { remoteJid: received.key.remoteJid, instanceId: this.instanceId },
+            where: { remoteJid: { in: contactLookup }, instanceId: this.instanceId },
           });
 
+          const incomingName = received.key.fromMe || isPlaceholderContactName(received.pushName) ? undefined : received.pushName;
           const contactRaw: {
             remoteJid: string;
-            pushName: string;
+            pushName?: string;
             profilePicUrl?: string;
             instanceId: string;
           } = {
-            remoteJid: received.key.remoteJid,
-            pushName: received.key.fromMe ? '' : received.key.fromMe == null ? '' : received.pushName,
-            profilePicUrl: (await this.profilePicture(received.key.remoteJid)).profilePictureUrl,
+            remoteJid: publicJid || received.key.remoteJid,
+            pushName: incomingName || contact?.pushName,
+            profilePicUrl: (await this.profilePicture(publicJid || received.key.remoteJid)).profilePictureUrl,
             instanceId: this.instanceId,
           };
 
@@ -1531,12 +1722,26 @@ export class BaileysStartupService extends ChannelStartupService {
               );
             }
 
-            if (this.configService.get<Database>('DATABASE').SAVE_DATA.CONTACTS)
-              await this.prismaRepository.contact.upsert({
-                where: { remoteJid_instanceId: { remoteJid: contactRaw.remoteJid, instanceId: contactRaw.instanceId } },
-                create: contactRaw,
-                update: contactRaw,
-              });
+            if (this.configService.get<Database>('DATABASE').SAVE_DATA.CONTACTS) {
+              try {
+                await this.prismaRepository.contact.update({
+                  where: { id: contact.id },
+                  data: {
+                    remoteJid: contactRaw.remoteJid,
+                    ...(incomingName ? { pushName: incomingName } : {}),
+                    profilePicUrl: contactRaw.profilePicUrl,
+                  },
+                });
+              } catch {
+                await this.prismaRepository.contact.update({
+                  where: { id: contact.id },
+                  data: {
+                    ...(incomingName ? { pushName: incomingName } : {}),
+                    profilePicUrl: contactRaw.profilePicUrl,
+                  },
+                });
+              }
+            }
 
             continue;
           }
@@ -1680,23 +1885,17 @@ export class BaileysStartupService extends ChannelStartupService {
 
               const cachedTimestamp = await this.baileysCache.get(messageKey);
 
-              if (!cachedTimestamp) {
-                if (status[update.status] === status[4]) {
-                  this.logger.log(`Update as read in message.update ${remoteJid} - ${timestamp}`);
-                  await this.updateMessagesReadedByTimestamp(remoteJid, timestamp);
-                  await this.baileysCache.set(messageKey, true, this.MESSAGE_CACHE_TTL_SECONDS);
-                }
-
-                await this.prismaRepository.message.update({
-                  where: { id: findMessage.id },
-                  data: { status: status[update.status] },
-                });
-              } else {
-                this.logger.info(
-                  `Update readed messages duplicated ignored in message.update [avoid deadlock]: ${messageKey}`,
-                );
+              if (!cachedTimestamp && status[update.status] === status[4]) {
+                this.logger.log(`Update as read in message.update ${remoteJid} - ${timestamp}`);
+                await this.updateMessagesReadedByTimestamp(remoteJid, timestamp);
+                await this.baileysCache.set(messageKey, true, this.MESSAGE_CACHE_TTL_SECONDS);
               }
             }
+
+            await this.prismaRepository.message.update({
+              where: { id: findMessage.id },
+              data: { status: status[update.status] },
+            });
           }
 
           this.sendDataWebhook(Events.MESSAGES_UPDATE, message);
@@ -2055,10 +2254,13 @@ export class BaileysStartupService extends ChannelStartupService {
   }
 
   public async getStatus(number: string) {
-    const jid = createJid(number);
+    const jid = toPublicPhoneJid(number) || createJid(number);
 
     try {
-      return { wuid: jid, status: (await this.client.fetchStatus(jid))[0]?.status };
+      const result = await this.client.fetchStatus(jid);
+      const first = Array.isArray(result) ? result[0] : result;
+      const status = typeof first === 'string' ? first : first?.status;
+      return { wuid: jid, status: status || null };
     } catch {
       return { wuid: jid, status: null };
     }
@@ -2066,51 +2268,79 @@ export class BaileysStartupService extends ChannelStartupService {
 
   public async fetchProfile(instanceName: string, number?: string) {
     const jid = number ? createJid(number) : this.client?.user?.id;
+    const publicFromLid = number ? await this.resolvePublicJid(jid) : jid;
+    const info = number ? (await this.whatsappNumber({ numbers: [publicFromLid || jid] }))?.shift() : undefined;
+    const resolvedJid = toPublicPhoneJid(info?.jid) || publicFromLid || info?.jid || jid;
+    const lookupValues = [...new Set([...jidLookupValues(resolvedJid), ...jidLookupValues(jid), toPublicPhoneJid(resolvedJid)].filter(Boolean))] as string[];
+    const stored = await this.prismaRepository.contact.findFirst({
+      where: {
+        instanceId: this.instanceId,
+        remoteJid: { in: lookupValues },
+      },
+    });
 
-    const onWhatsapp = (await this.whatsappNumber({ numbers: [jid] }))?.shift();
-
-    if (!onWhatsapp.exists) {
-      throw new BadRequestException(onWhatsapp);
-    }
-
+    const picture = await this.profilePicture(resolvedJid).catch(() => ({ profilePictureUrl: stored?.profilePicUrl }));
+    const about = number
+      ? await this.getStatus(toPublicPhoneJid(resolvedJid) || resolvedJid).catch(() => ({ status: null }))
+      : { status: null };
+    let business: NumberBusiness = { isBusiness: false };
     try {
-      if (number) {
-        const info = (await this.whatsappNumber({ numbers: [jid] }))?.shift();
-        const picture = await this.profilePicture(info?.jid);
-        const status = await this.getStatus(info?.jid);
-        const business = await this.fetchBusinessProfile(info?.jid);
-
-        return {
-          wuid: info?.jid || jid,
-          name: info?.name,
-          numberExists: info?.exists,
-          picture: picture?.profilePictureUrl,
-          status: status?.status,
-          isBusiness: business.isBusiness,
-          email: business?.email,
-          description: business?.description,
-          website: business?.website?.shift(),
-        };
-      } else {
-        const instanceNames = instanceName ? [instanceName] : null;
-        const info: Instance = await waMonitor.instanceInfo(instanceNames);
-        const business = await this.fetchBusinessProfile(jid);
-
-        return {
-          wuid: jid,
-          name: info?.profileName,
-          numberExists: true,
-          picture: info?.profilePicUrl,
-          status: info?.connectionStatus,
-          isBusiness: business.isBusiness,
-          email: business?.email,
-          description: business?.description,
-          website: business?.website?.shift(),
-        };
-      }
+      business = await this.fetchBusinessProfile(resolvedJid);
     } catch {
-      return { wuid: jid, name: null, picture: null, status: null, os: null, isBusiness: false };
+      business = { isBusiness: false };
     }
+    const statusText =
+      (typeof about?.status === 'string' && about.status) ||
+      business?.about ||
+      (typeof business?.description === 'string' ? business.description : null);
+
+    const storeContact = (this.client as any)?.store?.contacts?.[resolvedJid] || (this.client as any)?.store?.contacts?.[jid];
+    const verifiedName = typeof storeContact?.verifiedName === 'string' ? storeContact.verifiedName : undefined;
+    const name = info?.name || verifiedName || stored?.pushName || storeContact?.name || storeContact?.notify || null;
+    const publicJid = toPublicPhoneJid(resolvedJid) || toPublicPhoneJid(stored?.remoteJid) || resolvedJid;
+    const phone = publicPhoneDigits(publicJid) || publicPhoneDigits(stored?.remoteJid);
+
+    if (!number) {
+      const instanceNames = instanceName ? [instanceName] : null;
+      const instanceInfo: Instance = await waMonitor.instanceInfo(instanceNames);
+      return {
+        wuid: publicJid,
+        number: phone || undefined,
+        name: instanceInfo?.profileName || name,
+        numberExists: true,
+        picture: instanceInfo?.profilePicUrl || picture?.profilePictureUrl,
+        status: statusText,
+        isBusiness: business.isBusiness,
+        verified: Boolean(verifiedName),
+        verifiedName,
+        email: business?.email,
+        description: business?.description,
+        website: Array.isArray(business?.website) ? business.website[0] : Array.isArray(business?.websites) ? business.websites[0] : business?.website,
+        address: business?.address,
+        category: business?.category || business?.vertical,
+        handle: business?.profilehandle,
+        hours: business?.business_hours,
+      };
+    }
+
+    return {
+      wuid: publicJid,
+      number: phone || undefined,
+      name,
+      numberExists: info?.exists ?? Boolean(stored),
+      picture: picture?.profilePictureUrl || stored?.profilePicUrl || null,
+      status: statusText,
+      isBusiness: Boolean(business.isBusiness),
+      verified: Boolean(verifiedName),
+      verifiedName,
+      email: business?.email,
+      description: business?.description,
+      website: Array.isArray(business?.website) ? business.website[0] : Array.isArray(business?.websites) ? business.websites[0] : business?.website,
+      address: business?.address,
+      category: business?.category || business?.vertical,
+      handle: business?.profilehandle,
+      hours: business?.business_hours,
+    };
   }
 
   public async offerCall({ number, isVideo, callDuration }: OfferCallDto) {
@@ -2606,7 +2836,7 @@ export class BaileysStartupService extends ChannelStartupService {
         await this.client.sendPresenceUpdate('paused', sender);
       }
 
-      return { presence: data.presence };
+      return { presence: data.presence, jid: sender };
     } catch (error) {
       this.logger.error(error);
       throw new BadRequestException(error.toString());
@@ -2829,7 +3059,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
           const response = await axios.get(mediaMessage.media, config);
 
-          mimetype = response.headers['content-type'];
+          mimetype = String(response.headers['content-type'] || '');
         }
       }
 
@@ -3143,62 +3373,77 @@ export class BaileysStartupService extends ChannelStartupService {
       const isLpcm = isURL(audio) && /\.lpcm($|\?)/i.test(audio);
 
       return new Promise((resolve, reject) => {
-        const outputAudioStream = new PassThrough();
-        const chunks: Buffer[] = [];
-
-        outputAudioStream.on('data', (chunk) => chunks.push(chunk));
-        outputAudioStream.on('end', () => {
-          const outputBuffer = Buffer.concat(chunks);
-          resolve(outputBuffer);
-        });
-
-        outputAudioStream.on('error', (error) => {
-          console.log('error', error);
-          reject(error);
-        });
-
-        ffmpeg.setFfmpegPath(ffmpegPath.path);
-
-        let command = ffmpeg(inputAudioStream);
+        const args = ['-i', 'pipe:0'];
 
         if (isLpcm) {
           this.logger.verbose('Detected LPCM input – applying raw PCM settings');
-          command = command.inputFormat('s16le').inputOptions(['-ar', '24000', '-ac', '1']);
+          args.splice(0, 2, '-f', 's16le', '-ar', '24000', '-ac', '1', '-i', 'pipe:0');
         }
 
-        command
-          .outputFormat('ogg')
-          .noVideo()
-          .audioCodec('libopus')
-          .addOutputOptions('-avoid_negative_ts make_zero')
-          .audioBitrate('128k')
-          .audioFrequency(48000)
-          .audioChannels(1)
-          .outputOptions([
-            '-write_xing',
-            '0',
-            '-compression_level',
-            '10',
-            '-application',
-            'voip',
-            '-fflags',
-            '+bitexact',
-            '-flags',
-            '+bitexact',
-            '-id3v2_version',
-            '0',
-            '-map_metadata',
-            '-1',
-            '-map_chapters',
-            '-1',
-            '-write_bext',
-            '0',
-          ])
-          .pipe(outputAudioStream, { end: true })
-          .on('error', function (error) {
-            console.log('error', error);
-            reject(error);
-          });
+        args.push(
+          '-vn',
+          '-c:a',
+          'libopus',
+          '-b:a',
+          '128k',
+          '-ar',
+          '48000',
+          '-ac',
+          '1',
+          '-avoid_negative_ts',
+          'make_zero',
+          '-application',
+          'voip',
+          '-compression_level',
+          '10',
+          '-fflags',
+          '+bitexact',
+          '-flags',
+          '+bitexact',
+          '-map_metadata',
+          '-1',
+          '-map_chapters',
+          '-1',
+          '-f',
+          'ogg',
+          'pipe:1',
+        );
+
+        const ffmpegProcess = spawn(ffmpegPath.path, args);
+        const outputChunks: Buffer[] = [];
+        let stderrData = '';
+
+        ffmpegProcess.stdout.on('data', (chunk) => {
+          outputChunks.push(chunk);
+        });
+
+        ffmpegProcess.stderr.on('data', (data) => {
+          stderrData += data.toString();
+          this.logger.verbose(`ffmpeg stderr: ${data}`);
+        });
+
+        ffmpegProcess.on('error', (error) => {
+          console.error('Error in ffmpeg process', error);
+          reject(error);
+        });
+
+        ffmpegProcess.on('close', (code) => {
+          if (code === 0) {
+            resolve(Buffer.concat(outputChunks));
+            return;
+          }
+
+          this.logger.error(`ffmpeg exited with code ${code}`);
+          this.logger.error(`ffmpeg stderr: ${stderrData}`);
+          reject(new Error(`ffmpeg exited with code ${code}: ${stderrData}`));
+        });
+
+        inputAudioStream.pipe(ffmpegProcess.stdin);
+        inputAudioStream.on('error', (err) => {
+          console.error('Error in inputAudioStream', err);
+          ffmpegProcess.stdin.end();
+          reject(err);
+        });
       });
     }
   }
@@ -3675,97 +3920,127 @@ export class BaileysStartupService extends ChannelStartupService {
 
   public async markMessageAsRead(data: ReadMessageDto) {
     try {
-      const keys: proto.IMessageKey[] = [];
-      data.readMessages.forEach((read) => {
-        if (isJidGroup(read.remoteJid) || isPnUser(read.remoteJid)) {
-          keys.push({ remoteJid: read.remoteJid, fromMe: read.fromMe, id: read.id });
-        }
-      });
-      await this.client.readMessages(keys);
+      const keys: proto.IMessageKey[] = data.readMessages.map((read) => ({
+        remoteJid: read.remoteJid,
+        fromMe: read.fromMe,
+        id: read.id,
+      }));
+      if (keys.length) {
+        await this.client.readMessages(keys);
+      }
+      const jids = [...new Set(data.readMessages.map((read) => read.remoteJid).filter(Boolean))];
+      await Promise.all(jids.map((jid) => this.clearChatUnread(jid)));
       return { message: 'Read messages', read: 'success' };
     } catch (error) {
       throw new InternalServerErrorException('Read messages fail', error.toString());
     }
   }
 
-  public async getLastMessage(number: string) {
-    const where: any = { key: { remoteJid: number }, instanceId: this.instance.id };
+  private toChatModifyMessage(message?: LastMessage | { key?: LastMessage['key']; messageTimestamp?: number | string }): LastMessage | null {
+    const key = message?.key;
+    if (!key?.id || !key.remoteJid) return null;
+    let timestamp = Number(message.messageTimestamp || 0);
+    if (timestamp > 1_000_000_000_000) timestamp = Math.floor(timestamp / 1000);
+    if (!timestamp) timestamp = Math.floor(Date.now() / 1000);
+    return {
+      key: { id: key.id, fromMe: Boolean(key.fromMe), remoteJid: key.remoteJid },
+      messageTimestamp: timestamp,
+    };
+  }
 
+  public async getLastMessage(number: string): Promise<LastMessage | null> {
+    const variants = [...new Set([...jidLookupValues(number), number].filter(Boolean))];
     const messages = await this.prismaRepository.message.findMany({
-      where,
+      where: {
+        instanceId: this.instanceId,
+        OR: variants.flatMap((jid) => [
+          { key: { path: ['remoteJid'], equals: jid } },
+          { key: { path: ['remoteJidAlt'], equals: jid } },
+        ]),
+      },
       orderBy: { messageTimestamp: 'desc' },
       take: 1,
     });
 
-    if (messages.length === 0) {
-      throw new NotFoundException('Messages not found');
-    }
-
-    let lastMessage = messages.pop();
-
-    for (const message of messages) {
-      if (message.messageTimestamp >= lastMessage.messageTimestamp) {
-        lastMessage = message;
-      }
-    }
-
-    return lastMessage as unknown as LastMessage;
+    const last = messages[0];
+    if (!last) return null;
+    return this.toChatModifyMessage({
+      key: last.key as unknown as LastMessage['key'],
+      messageTimestamp: last.messageTimestamp,
+    });
   }
 
   public async archiveChat(data: ArchiveChatDto) {
-    try {
-      let last_message = data.lastMessage;
-      let number = data.chat;
-
-      if (!last_message && number) {
-        last_message = await this.getLastMessage(number);
-      } else {
-        last_message = data.lastMessage;
-        last_message.messageTimestamp = last_message?.messageTimestamp ?? Date.now();
-        number = last_message?.key?.remoteJid;
-      }
-
-      if (!last_message || Object.keys(last_message).length === 0) {
-        throw new NotFoundException('Last message not found');
-      }
-
-      await this.client.chatModify({ archive: data.archive, lastMessages: [last_message] }, createJid(number));
-
-      return { chatId: number, archived: true };
-    } catch (error) {
-      throw new InternalServerErrorException({
-        archived: false,
-        message: ['An error occurred while archiving the chat. Open a calling.', error.toString()],
-      });
+    const number = data.chat || data.lastMessage?.key?.remoteJid;
+    if (!number) {
+      throw new BadRequestException('Chat is required');
     }
+
+    const lastMessage = this.toChatModifyMessage(data.lastMessage) || (await this.getLastMessage(number));
+    const jid = createJid(number);
+
+    if (lastMessage) {
+      try {
+        await this.client.chatModify({ archive: data.archive, lastMessages: [lastMessage] }, jid);
+      } catch (error) {
+        this.logger.error(error);
+      }
+    }
+
+    await this.persistChatArchive(number, data.archive);
+    return { chatId: number, archived: data.archive };
+  }
+
+  private async persistChatArchive(remoteJid: string, archived: boolean) {
+    const variants = jidLookupValues(remoteJid);
+    const chats = await this.prismaRepository.chat.findMany({
+      where: { instanceId: this.instanceId, remoteJid: { in: variants } },
+    });
+    const nextLabels = (labels: unknown) => {
+      const current = Array.isArray(labels) ? labels.map((item) => String(item)) : [];
+      const without = current.filter((item) => item.toLowerCase() !== 'archived');
+      return archived ? [...without, 'archived'] : without;
+    };
+
+    if (chats.length === 0) {
+      await this.prismaRepository.chat.create({
+        data: { instanceId: this.instanceId, remoteJid, unreadMessages: 0, labels: nextLabels([]) },
+      });
+      return;
+    }
+
+    await Promise.all(
+      chats.map((chat) =>
+        this.prismaRepository.chat.update({
+          where: { id: chat.id },
+          data: { labels: nextLabels(chat.labels) },
+        }),
+      ),
+    );
   }
 
   public async markChatUnread(data: MarkChatUnreadDto) {
-    try {
-      let last_message = data.lastMessage;
-      let number = data.chat;
-
-      if (!last_message && number) {
-        last_message = await this.getLastMessage(number);
-      } else {
-        last_message = data.lastMessage;
-        last_message.messageTimestamp = last_message?.messageTimestamp ?? Date.now();
-        number = last_message?.key?.remoteJid;
-      }
-
-      if (!last_message || Object.keys(last_message).length === 0) {
-        throw new NotFoundException('Last message not found');
-      }
-
-      await this.client.chatModify({ markRead: false, lastMessages: [last_message] }, createJid(number));
-
-      return { chatId: number, markedChatUnread: true };
-    } catch (error) {
-      throw new InternalServerErrorException({
-        markedChatUnread: false,
-        message: ['An error occurred while marked unread the chat. Open a calling.', error.toString()],
-      });
+    const number = data.chat || data.lastMessage?.key?.remoteJid;
+    if (!number) {
+      throw new BadRequestException('Chat is required');
     }
+
+    const lastMessage = this.toChatModifyMessage(data.lastMessage) || (await this.getLastMessage(number));
+    if (lastMessage) {
+      try {
+        await this.client.chatModify({ markRead: false, lastMessages: [lastMessage] }, createJid(number));
+      } catch (error) {
+        this.logger.error(error);
+      }
+    }
+
+    const variants = jidLookupValues(number);
+    await this.prismaRepository.chat.updateMany({
+      where: { instanceId: this.instanceId, remoteJid: { in: variants.length ? variants : [number] } },
+      data: { unreadMessages: 1 },
+    });
+
+    return { chatId: number, markedChatUnread: true };
   }
 
   public async deleteMessage(del: DeleteMessage) {
@@ -4031,8 +4306,8 @@ export class BaileysStartupService extends ChannelStartupService {
       }
 
       return { isBusiness: true, ...profile };
-    } catch (error) {
-      throw new InternalServerErrorException('Error updating profile name', error.toString());
+    } catch {
+      return { isBusiness: false, message: 'Not is business profile' };
     }
   }
 
@@ -4756,6 +5031,41 @@ export class BaileysStartupService extends ChannelStartupService {
     return 0;
   }
 
+  private async incrementChatUnread(remoteJid: string) {
+    const variants = jidLookupValues(remoteJid);
+    const chats = await this.prismaRepository.chat.findMany({
+      where: { instanceId: this.instanceId, remoteJid: { in: variants.length ? variants : [remoteJid] } },
+    });
+    if (chats.length === 0) {
+      await this.prismaRepository.chat.create({
+        data: { instanceId: this.instanceId, remoteJid, unreadMessages: 1 },
+      });
+      return;
+    }
+    await Promise.all(
+      chats.map((chat) =>
+        this.prismaRepository.chat.update({
+          where: { id: chat.id },
+          data: { unreadMessages: (chat.unreadMessages || 0) + 1 },
+        }),
+      ),
+    );
+  }
+
+  private async clearChatUnread(remoteJid: string) {
+    const variants = jidLookupValues(remoteJid);
+    await this.prismaRepository.chat.updateMany({
+      where: { instanceId: this.instanceId, remoteJid: { in: variants.length ? variants : [remoteJid] } },
+      data: { unreadMessages: 0 },
+    });
+  }
+
+  public async setDisappearingMessages(data: { number: string; expiration: number }) {
+    const jid = createJid(data.number);
+    await this.client.sendMessage(jid, { disappearingMessagesInChat: data.expiration > 0 ? data.expiration : false });
+    return { number: jid, expiration: data.expiration };
+  }
+
   private async updateChatUnreadMessages(remoteJid: string): Promise<number> {
     const [chat, unreadMessages] = await Promise.all([
       this.prismaRepository.chat.findFirst({ where: { remoteJid } }),
@@ -5015,6 +5325,11 @@ export class BaileysStartupService extends ChannelStartupService {
 
   public async fetchMessages(query: Query<Message>) {
     const keyFilters = query?.where?.key as ExtendedIMessageKey;
+    const jids = jidLookupValues(keyFilters?.remoteJid || keyFilters?.remoteJidAlt);
+    const jidFilters = jids.flatMap((jid) => [
+      { key: { path: ['remoteJid'], equals: jid } },
+      { key: { path: ['remoteJidAlt'], equals: jid } },
+    ]);
 
     const timestampFilter = {};
     if (query?.where?.messageTimestamp) {
@@ -5037,12 +5352,7 @@ export class BaileysStartupService extends ChannelStartupService {
           keyFilters?.id ? { key: { path: ['id'], equals: keyFilters?.id } } : {},
           keyFilters?.fromMe ? { key: { path: ['fromMe'], equals: keyFilters?.fromMe } } : {},
           keyFilters?.participant ? { key: { path: ['participant'], equals: keyFilters?.participant } } : {},
-          {
-            OR: [
-              keyFilters?.remoteJid ? { key: { path: ['remoteJid'], equals: keyFilters?.remoteJid } } : {},
-              keyFilters?.remoteJidAlt ? { key: { path: ['remoteJidAlt'], equals: keyFilters?.remoteJidAlt } } : {},
-            ],
-          },
+          jidFilters.length > 0 ? { OR: jidFilters } : {},
         ],
       },
     });
@@ -5066,12 +5376,7 @@ export class BaileysStartupService extends ChannelStartupService {
           keyFilters?.id ? { key: { path: ['id'], equals: keyFilters?.id } } : {},
           keyFilters?.fromMe ? { key: { path: ['fromMe'], equals: keyFilters?.fromMe } } : {},
           keyFilters?.participant ? { key: { path: ['participant'], equals: keyFilters?.participant } } : {},
-          {
-            OR: [
-              keyFilters?.remoteJid ? { key: { path: ['remoteJid'], equals: keyFilters?.remoteJid } } : {},
-              keyFilters?.remoteJidAlt ? { key: { path: ['remoteJidAlt'], equals: keyFilters?.remoteJidAlt } } : {},
-            ],
-          },
+          jidFilters.length > 0 ? { OR: jidFilters } : {},
         ],
       },
       orderBy: { messageTimestamp: 'desc' },
@@ -5087,23 +5392,46 @@ export class BaileysStartupService extends ChannelStartupService {
         instanceId: true,
         source: true,
         contextInfo: true,
+        status: true,
         MessageUpdate: { select: { status: true } },
       },
     });
 
     const formattedMessages = messages.map((message) => {
-      const messageKey = message.key as { fromMe: boolean; remoteJid: string; id: string; participant?: string };
+      const messageKey = message.key as {
+        fromMe: boolean;
+        remoteJid: string;
+        remoteJidAlt?: string;
+        id: string;
+        participant?: string;
+      };
+      const phoneJid = phoneJidFromKey(messageKey);
+      if (phoneJid && phoneJid !== messageKey.remoteJid) {
+        message.key = { ...messageKey, remoteJid: phoneJid, remoteJidAlt: messageKey.remoteJid };
+      }
 
-      if (!message.pushName) {
-        if (messageKey.fromMe) {
-          message.pushName = 'Você';
-        } else if (message.contextInfo) {
-          const contextInfo = message.contextInfo as { participant?: string };
-          if (contextInfo.participant) {
-            message.pushName = contextInfo.participant.split('@')[0];
-          } else if (messageKey.participant) {
-            message.pushName = messageKey.participant.split('@')[0];
-          }
+      const updates = (message as { MessageUpdate?: { status?: string }[] }).MessageUpdate || [];
+      const rank = (value?: string) => {
+        const status = String(value || '').toUpperCase();
+        if (['READ', 'PLAYED', '4', '5'].includes(status)) return 4;
+        if (['DELIVERY_ACK', 'DELIVERED', '3'].includes(status)) return 3;
+        if (['SERVER_ACK', '2'].includes(status)) return 2;
+        if (['PENDING', '1'].includes(status)) return 1;
+        return 0;
+      };
+      const best = [message.status, ...updates.map((item) => item.status)].sort((left, right) => rank(right) - rank(left))[0];
+      if (best) {
+        (message as { status?: string }).status = best;
+      }
+
+      if (isPlaceholderContactName(message.pushName) && messageKey.fromMe) {
+        message.pushName = null;
+      } else if (!message.pushName && !messageKey.fromMe) {
+        const contextInfo = message.contextInfo as { participant?: string } | null;
+        if (contextInfo?.participant && !isLidJid(contextInfo.participant)) {
+          message.pushName = publicPhoneDigits(contextInfo.participant) || contextInfo.participant.split('@')[0];
+        } else if (messageKey.participant && !isLidJid(messageKey.participant)) {
+          message.pushName = publicPhoneDigits(messageKey.participant) || messageKey.participant.split('@')[0];
         }
       }
 

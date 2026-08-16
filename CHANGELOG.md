@@ -1,3 +1,21 @@
+# 2.4.0 (2026-08-16)
+
+### Features
+
+* **Inbox / Manager**: WhatsApp-like inbox with presence, last seen, disappearing-message timer, complete contact/business profiles, ticks, reactions, emoji picker, quoted replies, and floating composer
+* **Disappearing messages**: `POST /chat/updateDisappearingMessages` with official timers (off, 24h, 7d, 90d)
+* **Presence**: subscribe and display online / typing / last seen, including `@lid` ↔ phone matching
+* **Profiles**: fetch recado, business email/website/address/category/hours; verified badge only for official `verifiedName`
+* **Dependencies**: Baileys `7.0.0-rc14`, Express 5, ESLint 10
+
+### Fixed
+
+* **archiveChat** (#2495 / #2515 / #1358 / #695): Prisma JSON path filter in `getLastMessage`, LID/PN variants, local persist + WhatsApp `chatModify`, sync `archived` from `chats.update`
+* **Unread**: persist Baileys `unreadCount`, increment incoming, mark read on `@lid`, overlay variants in `fetchChats`
+* **Ticks**: persist outgoing `messages.update` status; list and bubbles use the highest receipt (sent / delivered / read)
+* **Auth / Express 5**: catch-all route `{*splat}`; instance isolation and LID/PN display
+* **Instance name**: trim whitespace on create (#2546)
+
 # 2.3.7 (2025-12-05)
 
 ### Features

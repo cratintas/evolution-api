@@ -12,6 +12,7 @@ import {
   openaiSettingSchema,
   openaiStatusSchema,
 } from '@validate/validate.schema';
+import { routeParam } from '@utils/route-param';
 import { RequestHandler, Router } from 'express';
 
 export class OpenaiRouter extends RouterBroker {
@@ -43,7 +44,7 @@ export class OpenaiRouter extends RouterBroker {
           request: req,
           schema: instanceSchema,
           ClassRef: InstanceDto,
-          execute: (instance) => openaiController.deleteCreds(instance, req.params.openaiCredsId),
+          execute: (instance) => openaiController.deleteCreds(instance, routeParam(req.params.openaiCredsId)),
         });
 
         res.status(HttpStatus.OK).json(response);
@@ -73,7 +74,7 @@ export class OpenaiRouter extends RouterBroker {
           request: req,
           schema: instanceSchema,
           ClassRef: InstanceDto,
-          execute: (instance) => openaiController.fetchBot(instance, req.params.openaiBotId),
+          execute: (instance) => openaiController.fetchBot(instance, routeParam(req.params.openaiBotId)),
         });
 
         res.status(HttpStatus.OK).json(response);
@@ -83,7 +84,7 @@ export class OpenaiRouter extends RouterBroker {
           request: req,
           schema: openaiSchema,
           ClassRef: OpenaiDto,
-          execute: (instance, data) => openaiController.updateBot(instance, req.params.openaiBotId, data),
+          execute: (instance, data) => openaiController.updateBot(instance, routeParam(req.params.openaiBotId), data),
         });
 
         res.status(HttpStatus.OK).json(response);
@@ -93,7 +94,7 @@ export class OpenaiRouter extends RouterBroker {
           request: req,
           schema: instanceSchema,
           ClassRef: InstanceDto,
-          execute: (instance) => openaiController.deleteBot(instance, req.params.openaiBotId),
+          execute: (instance) => openaiController.deleteBot(instance, routeParam(req.params.openaiBotId)),
         });
 
         res.status(HttpStatus.OK).json(response);
@@ -133,7 +134,7 @@ export class OpenaiRouter extends RouterBroker {
           request: req,
           schema: instanceSchema,
           ClassRef: InstanceDto,
-          execute: (instance) => openaiController.fetchSessions(instance, req.params.openaiBotId),
+          execute: (instance) => openaiController.fetchSessions(instance, routeParam(req.params.openaiBotId)),
         });
 
         res.status(HttpStatus.OK).json(response);

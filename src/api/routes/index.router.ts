@@ -8,6 +8,7 @@ import { StorageRouter } from '@api/integrations/storage/storage.router';
 import { waMonitor } from '@api/server.module';
 import { configService, Database, Facebook } from '@config/env.config';
 import { fetchLatestWaWebVersion } from '@utils/fetchLatestWaWebVersion';
+import { routeParam } from '@utils/route-param';
 import { NextFunction, Request, Response, Router } from 'express';
 import fs from 'fs';
 import mimeTypes from 'mime-types';
@@ -162,8 +163,8 @@ if (metricsConfig.ENABLED) {
 
 if (!serverConfig.DISABLE_MANAGER) router.use('/manager', new ViewsRouter().router);
 
-router.get('/assets/*', (req, res) => {
-  const fileName = req.params[0];
+router.get('/assets/{*fileName}', (req, res) => {
+  const fileName = routeParam(req.params.fileName);
 
   // Security: Reject paths containing traversal patterns
   if (!fileName || fileName.includes('..') || fileName.includes('\\') || path.isAbsolute(fileName)) {

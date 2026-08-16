@@ -11,6 +11,7 @@ import {
   difyStatusSchema,
   instanceSchema,
 } from '@validate/validate.schema';
+import { routeParam } from '@utils/route-param';
 import { RequestHandler, Router } from 'express';
 
 export class DifyRouter extends RouterBroker {
@@ -42,7 +43,7 @@ export class DifyRouter extends RouterBroker {
           request: req,
           schema: instanceSchema,
           ClassRef: InstanceDto,
-          execute: (instance) => difyController.fetchBot(instance, req.params.difyId),
+          execute: (instance) => difyController.fetchBot(instance, routeParam(req.params.difyId)),
         });
 
         res.status(HttpStatus.OK).json(response);
@@ -52,7 +53,7 @@ export class DifyRouter extends RouterBroker {
           request: req,
           schema: difySchema,
           ClassRef: DifyDto,
-          execute: (instance, data) => difyController.updateBot(instance, req.params.difyId, data),
+          execute: (instance, data) => difyController.updateBot(instance, routeParam(req.params.difyId), data),
         });
 
         res.status(HttpStatus.OK).json(response);
@@ -62,7 +63,7 @@ export class DifyRouter extends RouterBroker {
           request: req,
           schema: instanceSchema,
           ClassRef: InstanceDto,
-          execute: (instance) => difyController.deleteBot(instance, req.params.difyId),
+          execute: (instance) => difyController.deleteBot(instance, routeParam(req.params.difyId)),
         });
 
         res.status(HttpStatus.OK).json(response);
@@ -102,7 +103,7 @@ export class DifyRouter extends RouterBroker {
           request: req,
           schema: instanceSchema,
           ClassRef: InstanceDto,
-          execute: (instance) => difyController.fetchSessions(instance, req.params.difyId),
+          execute: (instance) => difyController.fetchSessions(instance, routeParam(req.params.difyId)),
         });
 
         res.status(HttpStatus.OK).json(response);

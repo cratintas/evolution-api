@@ -4,6 +4,7 @@ import { InstanceDto } from '@api/dto/instance.dto';
 import { HttpStatus } from '@api/routes/index.router';
 import { evolutionBotController } from '@api/server.module';
 import { instanceSchema } from '@validate/instance.schema';
+import { routeParam } from '@utils/route-param';
 import { RequestHandler, Router } from 'express';
 
 import { EvolutionBotDto, EvolutionBotSettingDto } from '../dto/evolutionBot.dto';
@@ -43,7 +44,7 @@ export class EvolutionBotRouter extends RouterBroker {
           request: req,
           schema: instanceSchema,
           ClassRef: InstanceDto,
-          execute: (instance) => evolutionBotController.fetchBot(instance, req.params.evolutionBotId),
+          execute: (instance) => evolutionBotController.fetchBot(instance, routeParam(req.params.evolutionBotId)),
         });
 
         res.status(HttpStatus.OK).json(response);
@@ -53,7 +54,7 @@ export class EvolutionBotRouter extends RouterBroker {
           request: req,
           schema: evolutionBotSchema,
           ClassRef: EvolutionBotDto,
-          execute: (instance, data) => evolutionBotController.updateBot(instance, req.params.evolutionBotId, data),
+          execute: (instance, data) => evolutionBotController.updateBot(instance, routeParam(req.params.evolutionBotId), data),
         });
 
         res.status(HttpStatus.OK).json(response);
@@ -63,7 +64,7 @@ export class EvolutionBotRouter extends RouterBroker {
           request: req,
           schema: instanceSchema,
           ClassRef: InstanceDto,
-          execute: (instance) => evolutionBotController.deleteBot(instance, req.params.evolutionBotId),
+          execute: (instance) => evolutionBotController.deleteBot(instance, routeParam(req.params.evolutionBotId)),
         });
 
         res.status(HttpStatus.OK).json(response);
@@ -103,7 +104,7 @@ export class EvolutionBotRouter extends RouterBroker {
           request: req,
           schema: instanceSchema,
           ClassRef: InstanceDto,
-          execute: (instance) => evolutionBotController.fetchSessions(instance, req.params.evolutionBotId),
+          execute: (instance) => evolutionBotController.fetchSessions(instance, routeParam(req.params.evolutionBotId)),
         });
 
         res.status(HttpStatus.OK).json(response);

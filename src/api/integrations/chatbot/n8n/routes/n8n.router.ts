@@ -10,6 +10,7 @@ import {
   n8nSettingSchema,
   n8nStatusSchema,
 } from '@validate/validate.schema';
+import { routeParam } from '@utils/route-param';
 import { RequestHandler, Router } from 'express';
 
 import { N8nDto, N8nSettingDto } from '../dto/n8n.dto';
@@ -41,7 +42,7 @@ export class N8nRouter extends RouterBroker {
           request: req,
           schema: instanceSchema,
           ClassRef: InstanceDto,
-          execute: (instance) => n8nController.fetchBot(instance, req.params.n8nId),
+          execute: (instance) => n8nController.fetchBot(instance, routeParam(req.params.n8nId)),
         });
         res.status(HttpStatus.OK).json(response);
       })
@@ -50,7 +51,7 @@ export class N8nRouter extends RouterBroker {
           request: req,
           schema: n8nSchema,
           ClassRef: N8nDto,
-          execute: (instance, data) => n8nController.updateBot(instance, req.params.n8nId, data),
+          execute: (instance, data) => n8nController.updateBot(instance, routeParam(req.params.n8nId), data),
         });
         res.status(HttpStatus.OK).json(response);
       })
@@ -59,7 +60,7 @@ export class N8nRouter extends RouterBroker {
           request: req,
           schema: instanceSchema,
           ClassRef: InstanceDto,
-          execute: (instance) => n8nController.deleteBot(instance, req.params.n8nId),
+          execute: (instance) => n8nController.deleteBot(instance, routeParam(req.params.n8nId)),
         });
         res.status(HttpStatus.OK).json(response);
       })
@@ -95,7 +96,7 @@ export class N8nRouter extends RouterBroker {
           request: req,
           schema: instanceSchema,
           ClassRef: InstanceDto,
-          execute: (instance) => n8nController.fetchSessions(instance, req.params.n8nId),
+          execute: (instance) => n8nController.fetchSessions(instance, routeParam(req.params.n8nId)),
         });
         res.status(HttpStatus.OK).json(response);
       })

@@ -1,6 +1,7 @@
 import {
   ArchiveChatDto,
   BlockUserDto,
+  DisappearingMessagesDto,
   DeleteMessage,
   getBase64FromMediaMessageDto,
   MarkChatUnreadDto,
@@ -76,6 +77,10 @@ export class ChatController {
 
   public async sendPresence({ instanceName }: InstanceDto, data: SendPresenceDto) {
     return await this.waMonitor.waInstances[instanceName].sendPresence(data);
+  }
+
+  public async setDisappearingMessages({ instanceName }: InstanceDto, data: DisappearingMessagesDto) {
+    return await this.waMonitor.waInstances[instanceName].setDisappearingMessages(data);
   }
 
   public async fetchPrivacySettings({ instanceName }: InstanceDto) {

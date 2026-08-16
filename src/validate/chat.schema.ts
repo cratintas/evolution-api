@@ -174,6 +174,16 @@ export const presenceSchema: JSONSchema7 = {
   required: ['number', 'presence', 'delay'],
 };
 
+export const disappearingMessagesSchema: JSONSchema7 = {
+  $id: v4(),
+  type: 'object',
+  properties: {
+    number: { type: 'string' },
+    expiration: { type: 'number' },
+  },
+  required: ['number', 'expiration'],
+};
+
 export const blockUserSchema: JSONSchema7 = {
   $id: v4(),
   type: 'object',
