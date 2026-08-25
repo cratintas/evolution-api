@@ -84,7 +84,7 @@
     "class-validator": "^0.15.1",
     "compression": "^1.8.1",
     "cors": "^2.8.6",
-    "dayjs": "^1.11.22",
+    "dayjs": "^1.11.23",
     "dotenv": "^17.4.2",
     "emoji-regex": "^10.6.0",
     "eventemitter2": "^6.4.9",
