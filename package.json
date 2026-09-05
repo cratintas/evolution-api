@@ -79,7 +79,7 @@
     "@sentry/node": "^10.70.0",
     "amqplib": "^2.0.1",
     "audio-decode": "^3.12.0",
-    "axios": "^1.19.0",
+    "axios": "^1.20.0",
     "baileys": "7.0.0-rc14",
     "class-validator": "^0.15.1",
     "compression": "^1.8.1",
